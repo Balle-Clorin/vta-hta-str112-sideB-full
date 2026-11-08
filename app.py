@@ -15,7 +15,7 @@ Upload one WAV of the whole of Side B. The app
 Requires vta_analyzer_core.py (REV-23 or later) in the same folder as app.py.
 """
 
-APP_REV    = "REV1"
+APP_REV    = "REV2"
 APP_SCRIPT = "app.py"
 
 import gc
@@ -36,6 +36,7 @@ import numpy as np
 import pandas as pd
 import soundfile as sf
 import streamlit as st
+from scipy.signal import resample_poly
 from matplotlib.gridspec import GridSpec
 
 HERE = Path(__file__).resolve().parent
@@ -121,40 +122,54 @@ def load_core():
 #  STEP 1 — TRACK DETECTION  (same logic as the desktop script)
 # ═════════════════════════════════════════════════════════════════════════════
 
-def detect_tracks(data, fs, win_s=0.5, hop_s=0.25, min_track_s=10.0, progress=None):
-    win, hop, N = int(fs * win_s), int(fs * hop_s), len(data)
+def detect_tracks(path, fs, n_frames, peak, win_s=0.5, hop_s=0.25,
+                  min_track_s=10.0, progress=None):
+    """Same detection as the desktop script, but streams the file from disk in
+    ~1 minute batches instead of holding the whole recording in memory."""
+    win, hop = int(fs * win_s), int(fs * hop_s)
     freqs = np.fft.rfftfreq(win, 1 / fs)
     hann = np.hanning(win)[:, None]
     m_car = (freqs > 3600) & (freqs < 4400)
     m_400 = (freqs > 370) & (freqs < 430)
     m_200 = (freqs > 175) & (freqs < 225)
 
-    starts = list(range(0, N - win, hop))
+    starts = list(range(0, n_frames - win, hop))
     segments = []
-    for k, start in enumerate(starts):
-        if progress is not None and k % 200 == 0:
-            progress(k / max(len(starts), 1))
-        sc = np.fft.rfft(data[start:start + win, :2].astype(np.float64) * hann, axis=0)
-        spec_avg = (np.abs(sc[:, 0]) + np.abs(sc[:, 1])) * (2 / win) / 2
-        t_mid = (start + win // 2) / fs
+    BATCH = 240                                   # windows per disk read (~60 s)
+    with sf.SoundFile(path) as f:
+        for b0 in range(0, len(starts), BATCH):
+            batch = starts[b0:b0 + BATCH]
+            blk0, blk1 = batch[0], batch[-1] + win
+            f.seek(blk0)
+            blk = f.read(blk1 - blk0, dtype="float32", always_2d=True)
+            if peak > 0:
+                blk /= peak
+            if progress is not None:
+                progress(b0 / max(len(starts), 1))
+            for start in batch:
+                o = start - blk0
+                sc = np.fft.rfft(blk[o:o + win, :2].astype(np.float64) * hann, axis=0)
+                spec_avg = (np.abs(sc[:, 0]) + np.abs(sc[:, 1])) * (2 / win) / 2
+                t_mid = (start + win // 2) / fs
 
-        if float(np.max(spec_avg[m_car])) < 0.01:
-            continue
-        amp_400 = float(np.max(spec_avg[m_400]))
-        amp_200 = float(np.max(spec_avg[m_200]))
-        if amp_400 > 0.01:
-            f_mod, mod_amp = 400, amp_400
-        elif amp_200 > 0.003:
-            f_mod, mod_amp = 200, amp_200
-        else:
-            continue
+                if float(np.max(spec_avg[m_car])) < 0.01:
+                    continue
+                amp_400 = float(np.max(spec_avg[m_400]))
+                amp_200 = float(np.max(spec_avg[m_200]))
+                if amp_400 > 0.01:
+                    f_mod, mod_amp = 400, amp_400
+                elif amp_200 > 0.003:
+                    f_mod, mod_amp = 200, amp_200
+                else:
+                    continue
 
-        mask_m = (freqs > f_mod - 20) & (freqs < f_mod + 20)
-        idx = int(np.argmax(np.abs(sc[mask_m, 0])))
-        ph_l = float(np.angle(sc[mask_m, 0][idx]))
-        ph_r = float(np.angle(sc[mask_m, 1][idx]))
-        lr = float(np.degrees((ph_l - ph_r + np.pi) % (2 * np.pi) - np.pi))
-        segments.append((t_mid, f_mod, "LAT" if abs(lr) < 60 else "VER", mod_amp))
+                mask_m = (freqs > f_mod - 20) & (freqs < f_mod + 20)
+                idx = int(np.argmax(np.abs(sc[mask_m, 0])))
+                ph_l = float(np.angle(sc[mask_m, 0][idx]))
+                ph_r = float(np.angle(sc[mask_m, 1][idx]))
+                lr = float(np.degrees((ph_l - ph_r + np.pi) % (2 * np.pi) - np.pi))
+                segments.append((t_mid, f_mod, "LAT" if abs(lr) < 60 else "VER", mod_amp))
+            del blk
 
     if not segments:
         return []
@@ -219,7 +234,10 @@ def classify_tracks(tracks, theta_vert, theta_lat):
 #  STEP 3 — VTA/HTA PER TRACK
 # ═════════════════════════════════════════════════════════════════════════════
 
-def analyse_tracks(tracks, data, fs, core, margin_frac, progress=None):
+def analyse_tracks(tracks, path, fs, core, margin_frac, ds_factor=1, progress=None):
+    """Reads each track from disk, one channel at a time. If ds_factor > 1 the
+    channel is decimated first (anti-aliased) to cut memory and run time."""
+    fs_eff = fs / ds_factor
     results = []
     for i, tr in enumerate(tracks):
         if progress is not None:
@@ -228,11 +246,16 @@ def analyse_tracks(tracks, data, fs, core, margin_frac, progress=None):
         margin = (tr["t_end"] - tr["t_start"]) * margin_frac
         s0 = int((tr["t_start"] + margin) * fs)
         s1 = int((tr["t_end"] - margin) * fs)
+        with sf.SoundFile(path) as f:
+            f.seek(s0)
+            blk = f.read(s1 - s0, dtype="float32", always_2d=True)
 
         ch_results = {}
         for ch_idx, ch in enumerate(["L", "R"]):
-            audio = data[s0:s1, ch_idx].astype(np.float64)
-            if len(audio) < fs * 2:
+            audio = blk[:, ch_idx].astype(np.float64)
+            if ds_factor > 1:
+                audio = resample_poly(audio, 1, ds_factor)
+            if len(audio) < fs_eff * 2:
                 continue
             pk = np.max(np.abs(audio))
             if pk < 1e-6:
@@ -242,7 +265,7 @@ def analyse_tracks(tracks, data, fs, core, margin_frac, progress=None):
                 warnings.simplefilter("ignore")
                 try:
                     ch_results[ch] = core.analyse(
-                        audio, fs, channel=ch,
+                        audio, fs_eff, channel=ch,
                         f_low=float(tr["f_mod"]), f_high=4000.0,
                         R=tr["radius_m"], V_low=tr["velocity"],
                         theta_r=tr["theta_r"],
@@ -251,6 +274,7 @@ def analyse_tracks(tracks, data, fs, core, margin_frac, progress=None):
                 except Exception as exc:                       # noqa: BLE001
                     st.warning(f"Track {i + 1} ch {ch} failed: {exc}")
             del audio
+        del blk
         if ch_results:
             results.append({**tr, "ch_results": ch_results})
         gc.collect()
@@ -394,6 +418,11 @@ with st.sidebar:
     theta_lat = st.number_input("θR lateral (°)", value=0.0, step=0.1, format="%.1f")
     rpm = st.number_input("Turntable speed (rpm)", value=33.333, step=0.001, format="%.3f")
     min_track_s = st.number_input("Minimum track length (s)", value=10.0, min_value=2.0, step=1.0)
+    downsample = st.checkbox(
+        "Decimate to ~48 kHz for analysis", value=True,
+        help="Only applies to recordings at 88.2 kHz or higher. Halves memory use and run time. "
+             "All signals of interest are below 5 kHz, so results change very little. "
+             "Turn off to analyse at the full recorded rate (needs much more memory).")
     st.markdown("---")
     st.markdown("Side B order expected: **A** LAT 400 ×4, **B** VER 400 ×3, "
                 "**C** LAT 200 ×4, **D** VER 200 ×3 (18 dB bands omitted). "
@@ -405,42 +434,50 @@ if up is None:
     st.info("Upload a stereo recording of the whole of Side B to begin.")
     st.stop()
 
-# ── Load audio from a temp file (avoids holding a second full copy in RAM) ──
+# ── Save the upload to disk; the audio is never held in RAM as a whole ──────
 file_key = hashlib.md5(f"{up.name}|{up.size}|{min_track_s}".encode()).hexdigest()
 
 if st.session_state.get("file_key") != file_key:
-    for k in ("data", "fs", "tracks_raw", "results", "fig_png", "notes"):
+    old = st.session_state.pop("wav_path", None)
+    if old and os.path.exists(old):
+        os.unlink(old)
+    for k in ("tracks_raw", "results", "fig_png"):
         st.session_state.pop(k, None)
     gc.collect()
     suffix = Path(up.name).suffix or ".wav"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        up.seek(0)
         while True:
             chunk = up.read(8 * 1024 * 1024)
             if not chunk:
                 break
             tmp.write(chunk)
         tmp_path = tmp.name
-    try:
-        with st.spinner("Reading audio…"):
-            data, fs = sf.read(tmp_path, always_2d=True, dtype="float32")
-    finally:
+    info = sf.info(tmp_path)
+    if info.channels < 2:
         os.unlink(tmp_path)
-    if data.shape[1] < 2:
         st.error("The file must be stereo (two channels).")
         st.stop()
-    pk = float(np.max(np.abs(data)))
-    if pk > 0:
-        data /= pk
-    st.session_state.update(data=data, fs=fs, file_key=file_key)
+    peak = 0.0
+    with st.spinner("Scanning level…"):
+        with sf.SoundFile(tmp_path) as f:
+            for blk in f.blocks(blocksize=1 << 20, dtype="float32", always_2d=True):
+                peak = max(peak, float(np.max(np.abs(blk))))
+    st.session_state.update(wav_path=tmp_path, fs=float(info.samplerate),
+                            n_frames=int(info.frames), peak=peak, file_key=file_key)
     bar = st.progress(0.0, text="Detecting tracks…")
     st.session_state["tracks_raw"] = detect_tracks(
-        data, fs, min_track_s=min_track_s, progress=lambda f: bar.progress(min(f, 1.0), text="Detecting tracks…"))
+        tmp_path, float(info.samplerate), int(info.frames), peak, min_track_s=min_track_s,
+        progress=lambda f_: bar.progress(min(f_, 1.0), text="Detecting tracks…"))
     bar.empty()
 
-data, fs = st.session_state["data"], st.session_state["fs"]
+wav_path, fs = st.session_state["wav_path"], st.session_state["fs"]
+n_frames = st.session_state["n_frames"]
 tracks_raw = st.session_state["tracks_raw"]
-st.write(f"**{up.name}** · {len(data) / fs:.1f} s · {fs:.0f} Hz · {data.shape[1]} ch · "
-         f"{len(tracks_raw)} track segments detected")
+ds_factor = max(1, int(round(fs / 48000.0))) if (downsample and fs >= 88200) else 1
+st.write(f"**{up.name}** · {n_frames / fs:.1f} s · {fs:.0f} Hz · "
+         f"{len(tracks_raw)} track segments detected"
+         + (f" · analysed at {fs / ds_factor:.0f} Hz" if ds_factor > 1 else ""))
 
 if not tracks_raw:
     st.error("No tracks detected. Check that this is a flat-recorded STR-112 Side B file.")
@@ -461,7 +498,7 @@ st.subheader("2 · Analysis")
 if st.button("Run VTA / HTA analysis", type="primary"):
     core.TURNTABLE_RPM = float(rpm)       # used by core.compute_vta at call time
     bar = st.progress(0.0, text="Starting…")
-    results = analyse_tracks(tracks, data, fs, core, margin_frac,
+    results = analyse_tracks(tracks, wav_path, fs, core, margin_frac, ds_factor,
                              progress=lambda f, m: bar.progress(min(f, 1.0), text=m))
     bar.empty()
     st.session_state["results"] = results

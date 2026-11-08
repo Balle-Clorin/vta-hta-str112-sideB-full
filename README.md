@@ -30,12 +30,17 @@ streamlit run app.py
 
 Record flat / bypass, not through RIAA (RIAA adds about 50-60° of phase shift at 200-400 Hz and can flip the sign on one channel). Upload the whole side as one stereo WAV. The upload limit is set to 1000 MB in `.streamlit/config.toml`.
 
+## Memory use (free hosting)
+
+The recording is saved to disk and read in pieces; it is never loaded whole. For recordings at 88.2 kHz or higher the app decimates each track to about 48 kHz before analysis (sidebar option, on by default), which roughly halves memory. Streamlit itself keeps the uploaded file in RAM, so a smaller upload helps: FLAC, or a 48 kHz 24-bit WAV, are much lighter than a 96 kHz WAV and give the same measurement.
+
 ## Settings
 
 - **Track margin**: fraction trimmed from each end of every track before analysis (0.05 default)
 - **θR vertical / lateral**: reference recording angles (16.5° / 0°)
 - **Turntable speed**: used for the formula coefficient (33.333 rpm)
 - **Minimum track length**: tracks shorter than this are ignored
+- **Decimate to ~48 kHz**: on by default for 88.2 kHz and above; turn off to analyse at the full rate
 
 ## Output
 
