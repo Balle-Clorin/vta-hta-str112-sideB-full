@@ -16,6 +16,7 @@ The +18 dB bands are omitted.
 ## Files
 
 - `app.py`: the Streamlit app (script name and revision are shown in the page header)
+- `sideb_worker.py`: runs the per-track analysis in short-lived worker processes. **Must sit next to `app.py`.**
 - `vta_analyzer_core.py`: single-track analyser, REV-23 or later. **Must sit next to `app.py`.**
 - `requirements.txt`, `.streamlit/config.toml`, `LICENSE`
 
@@ -32,7 +33,7 @@ Record flat / bypass, not through RIAA (RIAA adds about 50-60° of phase shift a
 
 ## Memory use (free hosting)
 
-The recording is saved to disk and read in pieces; it is never loaded whole. For recordings at 88.2 kHz or higher the app decimates each track to about 48 kHz before analysis (sidebar option, on by default), which roughly halves memory. Streamlit itself keeps the uploaded file in RAM, so a smaller upload helps: FLAC, or a 48 kHz 24-bit WAV, are much lighter than a 96 kHz WAV and give the same measurement.
+The recording is saved to disk and read in pieces; it is never loaded whole. The analysis runs in short-lived worker processes (two tracks each), because the analysis code keeps memory after every track; this way the memory is returned to the system and a second or third run does not grow the app. For recordings at 88.2 kHz or higher the app decimates each track to about 48 kHz before analysis (sidebar option, on by default), which roughly halves memory. Streamlit itself keeps the uploaded file in RAM, so a smaller upload helps: FLAC, or a 48 kHz 24-bit WAV, are much lighter than a 96 kHz WAV and give the same measurement.
 
 ## Settings
 

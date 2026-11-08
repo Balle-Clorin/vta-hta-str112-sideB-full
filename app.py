@@ -15,14 +15,18 @@ Upload one WAV of the whole of Side B. The app
 Requires vta_analyzer_core.py (REV-23 or later) in the same folder as app.py.
 """
 
-APP_REV    = "REV2"
+APP_REV    = "REV3"
 APP_SCRIPT = "app.py"
 
 import gc
 import hashlib
 import importlib.util
 import io
+import json
 import os
+import pickle
+import subprocess
+import sys
 import tempfile
 import warnings
 from pathlib import Path
@@ -36,7 +40,6 @@ import numpy as np
 import pandas as pd
 import soundfile as sf
 import streamlit as st
-from scipy.signal import resample_poly
 from matplotlib.gridspec import GridSpec
 
 HERE = Path(__file__).resolve().parent
@@ -234,50 +237,41 @@ def classify_tracks(tracks, theta_vert, theta_lat):
 #  STEP 3 — VTA/HTA PER TRACK
 # ═════════════════════════════════════════════════════════════════════════════
 
-def analyse_tracks(tracks, path, fs, core, margin_frac, ds_factor=1, progress=None):
-    """Reads each track from disk, one channel at a time. If ds_factor > 1 the
-    channel is decimated first (anti-aliased) to cut memory and run time."""
-    fs_eff = fs / ds_factor
-    results = []
-    for i, tr in enumerate(tracks):
-        if progress is not None:
-            progress(i / len(tracks), f"Track {i + 1}/{len(tracks)}: Grp {tr['group']} "
-                     f"{tr['mod_type']} {tr['f_mod']} Hz {tr['band']}")
-        margin = (tr["t_end"] - tr["t_start"]) * margin_frac
-        s0 = int((tr["t_start"] + margin) * fs)
-        s1 = int((tr["t_end"] - margin) * fs)
-        with sf.SoundFile(path) as f:
-            f.seek(s0)
-            blk = f.read(s1 - s0, dtype="float32", always_2d=True)
+TRACKS_PER_WORKER = 2     # tracks analysed per short-lived worker process
 
-        ch_results = {}
-        for ch_idx, ch in enumerate(["L", "R"]):
-            audio = blk[:, ch_idx].astype(np.float64)
-            if ds_factor > 1:
-                audio = resample_poly(audio, 1, ds_factor)
-            if len(audio) < fs_eff * 2:
+
+def analyse_tracks(tracks, path, fs, core_path, rpm, margin_frac, ds_factor=1, progress=None):
+    """Runs the analysis in worker processes (sideb_worker.py), a few tracks at a
+    time. Memory used by the analysis is returned to the OS when each worker
+    exits, so repeated runs do not accumulate memory in the Streamlit server."""
+    results = []
+    n = len(tracks)
+    for c0 in range(0, n, TRACKS_PER_WORKER):
+        idxs = list(range(c0, min(c0 + TRACKS_PER_WORKER, n)))
+        if progress is not None:
+            tr = tracks[idxs[0]]
+            progress(c0 / n, f"Tracks {idxs[0] + 1}-{idxs[-1] + 1} of {n}  "
+                     f"(Grp {tr['group']} {tr['mod_type']} {tr['f_mod']} Hz {tr['band']} …)")
+        job = {"core_path": str(core_path), "wav_path": os.path.abspath(path), "fs": fs, "rpm": rpm,
+               "margin_frac": margin_frac, "ds_factor": ds_factor,
+               "items": [{"index": i, "track": tracks[i]} for i in idxs]}
+        with tempfile.TemporaryDirectory() as td:
+            job_p, out_p = os.path.join(td, "job.json"), os.path.join(td, "out.pkl")
+            with open(job_p, "w", encoding="utf-8") as fh:
+                json.dump(job, fh)
+            proc = subprocess.run([sys.executable, str(HERE / "sideb_worker.py"), job_p, out_p],
+                                  capture_output=True, text=True, cwd=str(HERE))
+            if proc.returncode != 0 or not os.path.exists(out_p):
+                st.error(f"Analysis worker failed for tracks {idxs[0] + 1}-{idxs[-1] + 1} "
+                         f"(exit {proc.returncode}). {proc.stderr[-600:]}")
                 continue
-            pk = np.max(np.abs(audio))
-            if pk < 1e-6:
-                continue
-            audio = audio / pk
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                try:
-                    ch_results[ch] = core.analyse(
-                        audio, fs_eff, channel=ch,
-                        f_low=float(tr["f_mod"]), f_high=4000.0,
-                        R=tr["radius_m"], V_low=tr["velocity"],
-                        theta_r=tr["theta_r"],
-                        modulation="lateral" if tr["is_lateral"] else "vertical",
-                        verbose=False, _demo=False)
-                except Exception as exc:                       # noqa: BLE001
-                    st.warning(f"Track {i + 1} ch {ch} failed: {exc}")
-            del audio
-        del blk
-        if ch_results:
-            results.append({**tr, "ch_results": ch_results})
-        gc.collect()
+            with open(out_p, "rb") as fh:
+                part = pickle.load(fh)
+        for item in part:
+            for msg in item["errors"]:
+                st.warning(f"Track {item['index'] + 1} {msg}")
+            if item["ch_results"]:
+                results.append({**tracks[item["index"]], "ch_results": item["ch_results"]})
     if progress is not None:
         progress(1.0, "Analysis complete")
     return results
@@ -496,9 +490,8 @@ st.dataframe(tracks_table(tracks), hide_index=True, width="stretch")
 
 st.subheader("2 · Analysis")
 if st.button("Run VTA / HTA analysis", type="primary"):
-    core.TURNTABLE_RPM = float(rpm)       # used by core.compute_vta at call time
     bar = st.progress(0.0, text="Starting…")
-    results = analyse_tracks(tracks, wav_path, fs, core, margin_frac, ds_factor,
+    results = analyse_tracks(tracks, wav_path, fs, HERE / core_name, float(rpm), margin_frac, ds_factor,
                              progress=lambda f, m: bar.progress(min(f, 1.0), text=m))
     bar.empty()
     st.session_state["results"] = results
